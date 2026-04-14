@@ -1,0 +1,313 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+
+// ── Credentials ──────────────────────────────────────
+const char* ssid     = "wifi";
+const char* password = "password";
+
+// ── Pin Definitions ──────────────────────────────────
+#define MQ2_PIN          34   // Analog input
+#define DHT_PIN          4    // DHT11 data pin
+#define DHT_TYPE         DHT11
+#define RELAY_PUMP_PIN   26   // GPIO26 → Relay IN (Pump)
+#define BUZZER_PIN       25   // GPIO25 → Buzzer
+#define TRIG_PIN         13   // HC-SR04 Trigger
+#define ECHO_PIN         12   // HC-SR04 Echo
+
+// ── Thresholds ────────────────────────────────────────
+#define GAS_THRESHOLD       1500   // Raw ADC — tune for your environment
+#define PROXIMITY_CM        10     // Hand detected if distance < 10 cm
+#define PUMP_INTERVAL_MS    300000UL  // 5 minutes
+#define PUMP_ON_DURATION    10000UL   // Pump ON for 10 seconds per cycle
+#define BUZZER_COOLDOWN_MS  3000UL    // Min gap between proximity beep triggers
+
+// ── Objects ──────────────────────────────────────────
+DHT       dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+
+// ── State ────────────────────────────────────────────
+float    temperature      = 0;
+float    humidity         = 0;
+int      gasLevel         = 0;
+bool     gasAlert         = false;
+bool     pumpState        = false;
+bool     proximityAlert   = false;
+bool     manualPump       = false;
+float    lastDistance     = 999;
+
+unsigned long lastPumpTime      = 0;
+unsigned long pumpStartTime     = 0;
+unsigned long lastBuzzerTime    = 0;
+bool          pumpCycleActive   = false;
+
+// ── HC-SR04 Distance Reading ─────────────────────────
+float getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 999; // no echo = out of range
+  return (duration * 0.0343) / 2.0;
+}
+
+// ── Buzzer: 3 Short Beeps ────────────────────────────
+void beepThreeTimes() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH); delay(150);
+    digitalWrite(BUZZER_PIN, LOW);  delay(150);
+  }
+}
+
+// ── HTML Dashboard ────────────────────────────────────
+String buildDashboard() {
+  String gasColor      = gasAlert      ? "#e74c3c" : "#2ecc71";
+  String pumpColor     = pumpState     ? "#3498db" : "#95a5a6";
+  String proxColor     = proximityAlert ? "#e74c3c" : "#2ecc71";
+  String pumpLabel     = pumpState     ? "ON" : "OFF";
+  String proxLabel     = proximityAlert ? "⚠ HAND DETECTED" : "✔ Clear";
+  String gasLabel      = gasAlert      ? "⚠ GAS LEAK!" : "Normal";
+  String distStr       = (lastDistance >= 999) ? "Out of range" : (String(lastDistance, 1) + " cm");
+
+  String html = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="5">
+  <title>Dairy Farm — Shed Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0f1923;
+      color: #ecf0f1;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    header { text-align: center; padding: 20px 0 30px; }
+    header h1 { font-size: 1.8em; color: #3498db; letter-spacing: 2px; }
+    header p  { color: #7f8c8d; font-size: 0.85em; margin-top: 5px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .card {
+      background: #1a2738;
+      border-radius: 14px;
+      padding: 22px 18px;
+      border: 1px solid #243447;
+      text-align: center;
+      transition: transform 0.2s;
+    }
+    .card:hover { transform: translateY(-3px); }
+    .card .icon  { font-size: 2.2em; margin-bottom: 10px; }
+    .card .label { font-size: 0.75em; color: #7f8c8d; text-transform: uppercase; letter-spacing: 1px; }
+    .card .value { font-size: 2em; font-weight: 700; margin: 6px 0; }
+    .card .unit  { font-size: 0.8em; color: #7f8c8d; }
+    .alert-card  { border: 2px solid; }
+    .btn {
+      display: inline-block;
+      margin-top: 14px;
+      padding: 9px 22px;
+      border-radius: 8px;
+      font-size: 0.85em;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+    }
+    .btn-on  { background: #3498db; color: white; }
+    .btn-off { background: #e74c3c; color: white; }
+    footer { text-align: center; margin-top: 30px; color: #34495e; font-size: 0.75em; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🐄 Dairy Farm — Shed Monitor</h1>
+    <p>Auto-refreshes every 5 seconds &nbsp;|&nbsp; ESP32 Web Server</p>
+  </header>
+
+  <div class="grid">
+
+    <div class="card">
+      <div class="icon">🌡️</div>
+      <div class="label">Temperature</div>
+      <div class="value">)rawhtml" + String(temperature, 1) + R"rawhtml(</div>
+      <div class="unit">°C</div>
+    </div>
+
+    <div class="card">
+      <div class="icon">💧</div>
+      <div class="label">Humidity</div>
+      <div class="value">)rawhtml" + String(humidity, 1) + R"rawhtml(</div>
+      <div class="unit">%</div>
+    </div>
+
+    <div class="card alert-card" style="border-color:)rawhtml" + gasColor + R"rawhtml(">
+      <div class="icon">🔥</div>
+      <div class="label">Gas Level (MQ2)</div>
+      <div class="value" style="color:)rawhtml" + gasColor + R"rawhtml(">)rawhtml" + String(gasLevel) + R"rawhtml(</div>
+      <div class="unit">)rawhtml" + gasLabel + R"rawhtml(</div>
+    </div>
+
+    <div class="card" style="border-color:)rawhtml" + pumpColor + R"rawhtml(; border-width:2px; border-style:solid;">
+      <div class="icon">⛽</div>
+      <div class="label">Water Pump</div>
+      <div class="value" style="color:)rawhtml" + pumpColor + R"rawhtml(">)rawhtml" + pumpLabel + R"rawhtml(</div>
+      <div class="unit">Auto: every 5 min</div>
+      <a class="btn btn-on"  href="/pump/on">Manual ON</a>&nbsp;
+      <a class="btn btn-off" href="/pump/off">Turn OFF</a>
+    </div>
+
+    <div class="card alert-card" style="border-color:)rawhtml" + proxColor + R"rawhtml(">
+      <div class="icon">🖐️</div>
+      <div class="label">Proximity Sensor</div>
+      <div class="value" style="font-size:1.1em; color:)rawhtml" + proxColor + R"rawhtml(">)rawhtml" + proxLabel + R"rawhtml(</div>
+      <div class="unit">Distance: )rawhtml" + distStr + R"rawhtml(</div>
+    </div>
+
+  </div>
+
+  <footer>Shed ESP32 v2 &nbsp;•&nbsp; Dairy Farm Management System</footer>
+</body>
+</html>
+)rawhtml";
+  return html;
+}
+
+// ── Web Routes ────────────────────────────────────────
+void handleRoot() {
+  server.send(200, "text/html", buildDashboard());
+}
+
+void handlePumpOn() {
+  manualPump = true;
+  pumpState  = true;
+  digitalWrite(RELAY_PUMP_PIN, LOW);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handlePumpOff() {
+  manualPump      = false;
+  pumpState       = false;
+  pumpCycleActive = false;
+  digitalWrite(RELAY_PUMP_PIN, HIGH);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"temperature\":"  + String(temperature, 1)  + ",";
+  json += "\"humidity\":"     + String(humidity, 1)     + ",";
+  json += "\"gas\":"          + String(gasLevel)        + ",";
+  json += "\"gasAlert\":"     + String(gasAlert      ? "true" : "false") + ",";
+  json += "\"pump\":"         + String(pumpState     ? "true" : "false") + ",";
+  json += "\"proximity\":"    + String(proximityAlert ? "true" : "false") + ",";
+  json += "\"distance\":"     + String(lastDistance, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ── Setup ────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PUMP_PIN, OUTPUT);
+  pinMode(BUZZER_PIN,     OUTPUT);
+  pinMode(TRIG_PIN,       OUTPUT);
+  pinMode(ECHO_PIN,       INPUT);
+
+  digitalWrite(RELAY_PUMP_PIN, HIGH); // Pump OFF
+  digitalWrite(BUZZER_PIN,     LOW);  // Buzzer OFF
+  digitalWrite(TRIG_PIN,       LOW);
+
+  dht.begin();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+  Serial.println("Dashboard → http://" + WiFi.localIP().toString() + "/");
+
+  server.on("/",         handleRoot);
+  server.on("/pump/on",  handlePumpOn);
+  server.on("/pump/off", handlePumpOff);
+  server.on("/data",     handleData);
+  server.begin();
+
+  lastPumpTime = millis();
+}
+
+// ── Loop ─────────────────────────────────────────────
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  // --- Read DHT11 ---
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) temperature = t;
+  if (!isnan(h)) humidity    = h;
+
+  // --- Read MQ2 ---
+  gasLevel = analogRead(MQ2_PIN);
+  gasAlert = (gasLevel > GAS_THRESHOLD);
+
+  // --- Read HC-SR04 ---
+  lastDistance   = getDistanceCM();
+  proximityAlert = (lastDistance < PROXIMITY_CM);
+
+  // --- Proximity: beep 3 times (with cooldown so it doesn't repeat every loop) ---
+  if (proximityAlert && (now - lastBuzzerTime >= BUZZER_COOLDOWN_MS)) {
+    lastBuzzerTime = now;
+    Serial.printf("[PROXIMITY] Hand detected at %.1f cm — beeping!\n", lastDistance);
+    beepThreeTimes();
+  }
+
+  // --- Gas Alert: fast continuous beep (only if no proximity beep happening) ---
+  if (gasAlert && !proximityAlert) {
+    digitalWrite(BUZZER_PIN, (now / 300) % 2 == 0 ? HIGH : LOW);
+  }
+
+  // --- Stop buzzer if no alerts ---
+  if (!gasAlert && !proximityAlert) {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // --- Auto Pump: every 5 min, runs 10 seconds ---
+  if (!manualPump) {
+    if (!pumpCycleActive && (now - lastPumpTime >= PUMP_INTERVAL_MS)) {
+      pumpCycleActive = true;
+      pumpStartTime   = now;
+      pumpState       = true;
+      digitalWrite(RELAY_PUMP_PIN, LOW);
+      Serial.println("[PUMP] Auto cycle started.");
+    }
+    if (pumpCycleActive && (now - pumpStartTime >= PUMP_ON_DURATION)) {
+      pumpCycleActive = false;
+      pumpState       = false;
+      lastPumpTime    = now;
+      digitalWrite(RELAY_PUMP_PIN, HIGH);
+      Serial.println("[PUMP] Auto cycle done.");
+    }
+  }
+
+  Serial.printf("[SHED] T:%.1f°C H:%.1f%% Gas:%d Dist:%.1fcm Pump:%s\n",
+    temperature, humidity, gasLevel, lastDistance,
+    pumpState ? "ON" : "OFF");
+
+  delay(500); // 500ms loop — fast enough for responsive proximity detection
+}
