@@ -1,0 +1,75 @@
+/*
+  Arduino UNO Self Test (No external components required)
+*/
+
+const int ledPin = 13; // Built-in LED
+
+void setup() {
+  Serial.begin(9600);
+  delay(2000);
+
+  Serial.println("=== Arduino UNO Self Test Start ===");
+
+  // Test LED
+  pinMode(ledPin, OUTPUT);
+  Serial.println("Testing Built-in LED (Pin 13)...");
+  
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(300);
+    digitalWrite(ledPin, LOW);
+    delay(300);
+  }
+
+  Serial.println("LED Test Done\n");
+
+  // Test Digital Pins (2–12)
+  Serial.println("Testing Digital Pins...");
+  for (int pin = 2; pin <= 12; pin++) {
+    pinMode(pin, OUTPUT);
+
+    digitalWrite(pin, HIGH);
+    delay(50);
+    digitalWrite(pin, LOW);
+    delay(50);
+
+    Serial.print("Pin ");
+    Serial.print(pin);
+    Serial.println(" toggled");
+  }
+  Serial.println("Digital Pin Test Done\n");
+
+  // Test Analog Pins (A0–A5)
+  Serial.println("Testing Analog Pins (floating values expected)...");
+  for (int pin = A0; pin <= A5; pin++) {
+    int value = analogRead(pin);
+
+    Serial.print("Analog Pin A");
+    Serial.print(pin - A0);
+    Serial.print(" = ");
+    Serial.println(value);
+
+    delay(200);
+  }
+  Serial.println("Analog Test Done\n");
+
+  // Timing Test
+  Serial.println("Testing millis() timing...");
+  unsigned long start = millis();
+  delay(1000);
+  unsigned long end = millis();
+
+  Serial.print("Expected ~1000 ms, got: ");
+  Serial.print(end - start);
+  Serial.println(" ms\n");
+
+  Serial.println("=== TEST COMPLETE ===");
+}
+
+void loop() {
+  // Keep blinking LED to show board is alive
+  digitalWrite(ledPin, HIGH);
+  delay(1000);
+  digitalWrite(ledPin, LOW);
+  delay(1000);
+}
