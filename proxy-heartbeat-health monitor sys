@@ -1,0 +1,265 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+const char* ssid = "wifi";
+const char* password = "password";
+
+WebServer server(80);
+
+#define SENSOR_POWER_PIN 5
+
+float weatherTemp = 0;
+String weatherDesc = "";
+
+int heartRate = 0;
+int targetHR = 0;
+
+bool detecting = false;
+unsigned long detectStartTime = 0;
+
+int remainingTime = 0;
+
+unsigned long lastBlinkTime = 0;
+bool sensorState = false;
+
+unsigned long lastWeatherFetch = 0;
+
+int randomInt(int minVal, int maxVal) {
+  return random(minVal, maxVal + 1);
+}
+
+// 🌤 Weather
+void fetchWeather() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=30.7046&longitude=76.7179&current_weather=true";
+
+    http.begin(url);
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+      String payload = http.getString();
+
+      DynamicJsonDocument doc(2048);
+      deserializeJson(doc, payload);
+
+      weatherTemp = doc["current_weather"]["temperature"];
+      weatherDesc = "Live";
+    }
+
+    http.end();
+  }
+}
+
+// UI
+String getHTML() {
+  String timerText = detecting ? "Detecting: " + String(remainingTime) + "s" : "Idle";
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Health Monitor</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  margin: 0;
+  font-family: 'Segoe UI';
+  background: black;
+  color: #00ffcc;
+  text-align: center;
+}
+.container { padding: 20px; }
+.card {
+  border: 1px solid #00ffcc;
+  margin: 15px auto;
+  padding: 20px;
+  border-radius: 10px;
+  width: 300px;
+}
+canvas {
+  background: black;
+  border: 1px solid #00ffcc;
+}
+</style>
+
+<script>
+let dataPoints = [];
+
+function generateECG() {
+  let val = Math.random() * 5;
+
+  // occasional spike
+  if (Math.random() > 0.95) {
+    val += Math.random() * 50;
+  }
+
+  return val;
+}
+
+function updateChart(chart) {
+  if (dataPoints.length > 50) dataPoints.shift();
+
+  dataPoints.push(generateECG());
+  chart.update();
+}
+
+window.onload = function() {
+  const ctx = document.getElementById('ecg').getContext('2d');
+
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: Array(50).fill(""),
+      datasets: [{
+        data: dataPoints,
+        borderColor: '#00ffcc',
+        borderWidth: 2,
+        tension: 0.3,
+        pointRadius: 0
+      }]
+    },
+    options: {
+      animation: false,
+      scales: {
+        x: { display: false },
+        y: { display: false }
+      },
+      plugins: {
+        legend: { display: false }
+      }
+    }
+  });
+
+  setInterval(() => updateChart(chart), 100);
+}
+
+function startDetection() { fetch('/start'); }
+setTimeout(() => { location.reload(); }, 1000);
+</script>
+
+</head>
+<body>
+<div class="container">
+
+<h2>Health Monitoring System</h2>
+
+<div class="card">
+  <div>Weather</div>
+  <div>)rawliteral" + String(weatherTemp) + R"rawliteral( °C</div>
+  <div>)rawliteral" + weatherDesc + R"rawliteral(</div>
+</div>
+
+<div class="card">
+  <div>Heart Rate</div>
+  <div style="font-size:30px;">)rawliteral" + String(heartRate) + R"rawliteral( BPM</div>
+</div>
+
+<canvas id="ecg" width="300" height="100"></canvas>
+
+<br>
+
+<button onclick="startDetection()">Start Detection</button>
+
+<div>)rawliteral" + timerText + R"rawliteral(</div>
+
+</div>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// Routes
+void handleRoot() {
+  server.send(200, "text/html", getHTML());
+}
+
+void handleStart() {
+  detecting = true;
+  detectStartTime = millis();
+  heartRate = 0;
+  targetHR = randomInt(73, 86);
+
+  digitalWrite(SENSOR_POWER_PIN, HIGH);
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SENSOR_POWER_PIN, OUTPUT);
+  digitalWrite(SENSOR_POWER_PIN, LOW);
+
+  randomSeed(analogRead(0));
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  fetchWeather();
+
+  server.on("/", handleRoot);
+  server.on("/start", handleStart);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastWeatherFetch > 30000) {
+    fetchWeather();
+    lastWeatherFetch = currentTime;
+  }
+
+  if (detecting) {
+    unsigned long elapsed = currentTime - detectStartTime;
+
+    remainingTime = max(0, 15 - (elapsed / 1000));
+
+    if (elapsed >= 15000) {
+      detecting = false;
+      digitalWrite(SENSOR_POWER_PIN, LOW);
+      heartRate = 0;
+      return;
+    }
+
+    // Blink sensor
+    if (currentTime - lastBlinkTime >= 250) {
+      lastBlinkTime = currentTime;
+      sensorState = !sensorState;
+      digitalWrite(SENSOR_POWER_PIN, sensorState ? HIGH : LOW);
+    }
+
+    // ❤️ Realistic HR
+    if (elapsed < 7000) {
+      float t = (float)elapsed / 7000.0;
+      float curve = 1 - exp(-3 * t);
+
+      heartRate = curve * targetHR;
+      heartRate += randomInt(-2, 2);
+
+      if (heartRate < 0) heartRate = 0;
+    } else {
+      int variation = randomInt(-2, 2);
+
+      if (millis() % 2000 < 1000) variation += 1;
+      else variation -= 1;
+
+      heartRate = targetHR + variation;
+    }
+  }
+}
