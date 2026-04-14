@@ -1,0 +1,742 @@
+// ESP32-CAM Pet Bot
+// Single tap: alert face
+// Double tap: cycle face -> weather/time -> quotes -> system info -> face
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+
+#include <Adafruit_SSD1306.h>
+#include <FluxGarage_RoboEyes.h>
+
+#define WIFI_SSID "wifi"
+#define WIFI_PASS "password"
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// ESP32-CAM pin suggestion for a 0.96" SSD1306 and TTP223.
+// Change these if your board wiring is different.
+#define OLED_SDA_PIN 14
+#define OLED_SCL_PIN 15
+#define TOUCH_PIN 13
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+
+enum ScreenMode {
+  MODE_FACE = 0,
+  MODE_WEATHER = 1,
+  MODE_QUOTES = 2,
+  MODE_SYSTEM = 3
+};
+
+struct WeatherSnapshot {
+  bool valid = false;
+  float temperature = 0.0f;
+  float windSpeed = 0.0f;
+  int weatherCode = -1;
+  unsigned long lastUpdateMs = 0;
+};
+
+struct QuoteSnapshot {
+  bool valid = false;
+  String text;
+  unsigned long lastUpdateMs = 0;
+};
+
+static ScreenMode currentMode = MODE_FACE;
+static bool faceAlert = false;
+static unsigned long faceAlertUntilMs = 0;
+
+static unsigned long lastWeatherFetchAttemptMs = 0;
+static unsigned long lastQuoteFetchAttemptMs = 0;
+static unsigned long lastWiFiAttemptMs = 0;
+static unsigned long lastTapMs = 0;
+static bool weatherRefreshRequested = true;
+static bool quoteRefreshRequested = true;
+
+static bool touchRaw = false;
+static bool touchStable = false;
+static unsigned long touchRawChangedMs = 0;
+
+static WeatherSnapshot weather;
+static QuoteSnapshot quoteCache[10];
+static int quoteCacheCount = 0;
+static int quoteCacheHead = 0;
+static int quoteCurrentIndex = -1;
+static String quoteDisplayedText;
+static int quoteScrollX = SCREEN_WIDTH;
+static int quoteScrollTextWidth = 0;
+static unsigned long quoteScrollLastStepMs = 0;
+
+static const int QUOTE_CACHE_SIZE = 5;
+
+static const unsigned long TOUCH_DEBOUNCE_MS = 35;
+static const unsigned long DOUBLE_TAP_MS = 420;
+static const unsigned long FACE_ALERT_HOLD_MS = 5000;
+static const unsigned long WIFI_RETRY_MS = 30000;
+static const unsigned long WEATHER_RETRY_MS = 60000;
+static const unsigned long WEATHER_REFRESH_MS = 15UL * 60UL * 1000UL;
+static const unsigned long QUOTE_REFRESH_MS = 30UL * 60UL * 1000UL;
+static const unsigned long QUOTE_SCROLL_STEP_MS = 45;
+
+const char *WEATHER_URL = "https://api.open-meteo.com/v1/forecast?latitude=30.7046&longitude=76.7179&current_weather=true&timezone=Asia%2FKolkata";
+const char *QUOTE_URL = "https://api.kanye.rest/";
+
+void connectWiFi();
+void ensureWiFi();
+void syncTime();
+bool fetchWeather(bool force);
+bool fetchQuote(bool force);
+bool primeQuoteCache();
+bool parseWeatherPayload(const String &payload);
+String parseQuotePayload(const String &payload);
+bool extractIntField(const String &section, const char *key, int &value);
+bool extractFloatField(const String &section, const char *key, float &value);
+const char *weatherCodeLabel(int code);
+void resetQuoteScroll();
+String getCurrentQuoteText();
+void storeQuote(const String &quoteText);
+void enterFaceRest();
+void enterFaceAlert();
+void enterMode(ScreenMode mode);
+void cycleMode();
+void handleSingleTap();
+void handleDoubleTap();
+void pollTouch();
+void drawWeatherScreen();
+void drawQuoteScreen();
+void drawSystemScreen();
+void formatUptime(char *buffer, size_t bufferSize);
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(TOUCH_PIN, INPUT);
+
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;) {
+      delay(1000);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 60);
+  roboEyes.setDisplayColors(0, 1);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  connectWiFi();
+  syncTime();
+
+  enterFaceRest();
+  roboEyes.update();
+  primeQuoteCache();
+  weatherRefreshRequested = true;
+  quoteRefreshRequested = false;
+}
+
+void loop() {
+  ensureWiFi();
+  pollTouch();
+
+  unsigned long now = millis();
+
+  if (currentMode == MODE_FACE) {
+    if (faceAlert && now >= faceAlertUntilMs) {
+      enterFaceRest();
+    }
+    roboEyes.update();
+  } else if (currentMode == MODE_WEATHER) {
+    unsigned long refreshInterval = weather.valid ? WEATHER_REFRESH_MS : WEATHER_RETRY_MS;
+    if (weatherRefreshRequested || now - lastWeatherFetchAttemptMs >= refreshInterval) {
+      bool forceRefresh = weatherRefreshRequested;
+      weatherRefreshRequested = false;
+      fetchWeather(forceRefresh);
+    }
+    drawWeatherScreen();
+    delay(25);
+  } else if (currentMode == MODE_QUOTES) {
+    unsigned long refreshInterval = quoteCacheCount > 0 ? QUOTE_REFRESH_MS : WEATHER_RETRY_MS;
+    if (quoteRefreshRequested || now - lastQuoteFetchAttemptMs >= refreshInterval) {
+      bool forceRefresh = quoteRefreshRequested;
+      quoteRefreshRequested = false;
+      fetchQuote(forceRefresh);
+    }
+    drawQuoteScreen();
+    delay(35);
+  } else {
+    drawSystemScreen();
+    delay(50);
+  }
+}
+
+void connectWiFi() {
+  lastWiFiAttemptMs = millis();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastWiFiAttemptMs < WIFI_RETRY_MS) {
+    return;
+  }
+
+  connectWiFi();
+}
+
+void syncTime() {
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+void enterFaceRest() {
+  currentMode = MODE_FACE;
+  faceAlert = false;
+  faceAlertUntilMs = 0;
+
+  roboEyes.setAutoblinker(ON, 6, 4);
+  roboEyes.setIdleMode(OFF, 0, 0);
+  roboEyes.setMood(TIRED);
+  roboEyes.setPosition(DEFAULT);
+  roboEyes.open();
+}
+
+void enterFaceAlert() {
+  currentMode = MODE_FACE;
+  faceAlert = true;
+  faceAlertUntilMs = millis() + FACE_ALERT_HOLD_MS;
+
+  roboEyes.setAutoblinker(OFF, 0, 0);
+  roboEyes.setIdleMode(OFF, 0, 0);
+  roboEyes.setMood(DEFAULT);
+  roboEyes.setPosition(DEFAULT);
+  roboEyes.open();
+}
+
+void enterMode(ScreenMode mode) {
+  currentMode = mode;
+
+  if (mode == MODE_FACE) {
+    enterFaceRest();
+  } else {
+    faceAlert = false;
+    faceAlertUntilMs = 0;
+    roboEyes.setAutoblinker(OFF, 0, 0);
+    roboEyes.setIdleMode(OFF, 0, 0);
+    roboEyes.setMood(DEFAULT);
+    roboEyes.open();
+
+    if (mode == MODE_WEATHER) {
+      weatherRefreshRequested = true;
+    } else if (mode == MODE_QUOTES) {
+      quoteRefreshRequested = true;
+      if (quoteCacheCount > 0 && quoteCurrentIndex < 0) {
+        quoteCurrentIndex = (quoteCacheHead - 1 + QUOTE_CACHE_SIZE) % QUOTE_CACHE_SIZE;
+      }
+    }
+  }
+}
+
+void cycleMode() {
+  if (currentMode == MODE_FACE) {
+    enterMode(MODE_WEATHER);
+  } else if (currentMode == MODE_WEATHER) {
+    enterMode(MODE_QUOTES);
+  } else if (currentMode == MODE_QUOTES) {
+    enterMode(MODE_SYSTEM);
+  } else {
+    enterMode(MODE_FACE);
+  }
+}
+
+void handleSingleTap() {
+  if (currentMode == MODE_FACE) {
+    enterFaceAlert();
+  } else if (currentMode == MODE_WEATHER) {
+    weatherRefreshRequested = true;
+  } else if (currentMode == MODE_QUOTES) {
+    quoteRefreshRequested = true;
+  } else {
+    drawSystemScreen();
+  }
+}
+
+void handleDoubleTap() {
+  cycleMode();
+}
+
+void pollTouch() {
+  unsigned long now = millis();
+  bool raw = digitalRead(TOUCH_PIN) == HIGH;
+
+  if (raw != touchRaw) {
+    touchRaw = raw;
+    touchRawChangedMs = now;
+  }
+
+  if ((now - touchRawChangedMs) < TOUCH_DEBOUNCE_MS) {
+    return;
+  }
+
+  if (touchStable == touchRaw) {
+    return;
+  }
+
+  touchStable = touchRaw;
+  if (!touchStable) {
+    return;
+  }
+
+  if (lastTapMs != 0 && (now - lastTapMs) <= DOUBLE_TAP_MS) {
+    lastTapMs = 0;
+    handleDoubleTap();
+  } else {
+    lastTapMs = now;
+    handleSingleTap();
+  }
+}
+
+bool fetchWeather(bool force) {
+  unsigned long now = millis();
+  unsigned long retryInterval = weather.valid ? WEATHER_REFRESH_MS : WEATHER_RETRY_MS;
+
+  if (!force && now - lastWeatherFetchAttemptMs < retryInterval) {
+    return weather.valid;
+  }
+
+  lastWeatherFetchAttemptMs = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(8000);
+
+  if (!http.begin(client, WEATHER_URL)) {
+    return false;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  return parseWeatherPayload(payload);
+}
+
+bool fetchQuote(bool force) {
+  unsigned long now = millis();
+  unsigned long retryInterval = quoteCacheCount > 0 ? QUOTE_REFRESH_MS : WEATHER_RETRY_MS;
+
+  if (!force && now - lastQuoteFetchAttemptMs < retryInterval) {
+    return quoteCacheCount > 0;
+  }
+
+  lastQuoteFetchAttemptMs = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(8000);
+
+  if (!http.begin(client, QUOTE_URL)) {
+    return false;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  String quoteText = parseQuotePayload(payload);
+  if (quoteText.length() == 0) {
+    return false;
+  }
+
+  storeQuote(quoteText);
+  return true;
+}
+
+bool primeQuoteCache() {
+  bool fetchedAny = false;
+
+  for (int i = 0; i < QUOTE_CACHE_SIZE; i++) {
+    if (fetchQuote(true)) {
+      fetchedAny = true;
+    }
+    delay(120);
+  }
+
+  if (quoteCacheCount > 0) {
+    quoteCurrentIndex = (quoteCacheHead - 1 + QUOTE_CACHE_SIZE) % QUOTE_CACHE_SIZE;
+    resetQuoteScroll();
+  }
+
+  return fetchedAny;
+}
+
+bool parseWeatherPayload(const String &payload) {
+  int objectStart = payload.indexOf("\"current_weather\"");
+  if (objectStart < 0) {
+    return false;
+  }
+
+  int objectEnd = payload.indexOf("}", objectStart);
+  if (objectEnd < 0) {
+    return false;
+  }
+
+  String section = payload.substring(objectStart, objectEnd + 1);
+
+  float tempValue = 0.0f;
+  float windValue = 0.0f;
+  int codeValue = -1;
+
+  if (!extractFloatField(section, "\"temperature\":", tempValue)) {
+    return false;
+  }
+  if (!extractFloatField(section, "\"windspeed\":", windValue)) {
+    return false;
+  }
+  if (!extractIntField(section, "\"weathercode\":", codeValue)) {
+    return false;
+  }
+
+  weather.valid = true;
+  weather.temperature = tempValue;
+  weather.windSpeed = windValue;
+  weather.weatherCode = codeValue;
+  weather.lastUpdateMs = millis();
+  return true;
+}
+
+String parseQuotePayload(const String &payload) {
+  int quoteKey = payload.indexOf("\"quote\"");
+  if (quoteKey < 0) {
+    return "";
+  }
+
+  int firstQuote = payload.indexOf('"', quoteKey + 7);
+  if (firstQuote < 0) {
+    return "";
+  }
+
+  int secondQuote = payload.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) {
+    return "";
+  }
+
+  String quoteText = payload.substring(firstQuote + 1, secondQuote);
+  quoteText.replace("\\n", " ");
+  quoteText.replace("\\r", " ");
+  quoteText.replace("\\t", " ");
+  quoteText.replace("\\\"", "\"");
+  return quoteText;
+}
+
+bool extractIntField(const String &section, const char *key, int &value) {
+  int keyPos = section.indexOf(key);
+  if (keyPos < 0) {
+    return false;
+  }
+
+  keyPos += strlen(key);
+  int endPos = keyPos;
+  while (endPos < (int)section.length()) {
+    char c = section[endPos];
+    if ((c >= '0' && c <= '9') || c == '-') {
+      endPos++;
+      continue;
+    }
+    break;
+  }
+
+  value = section.substring(keyPos, endPos).toInt();
+  return true;
+}
+
+bool extractFloatField(const String &section, const char *key, float &value) {
+  int keyPos = section.indexOf(key);
+  if (keyPos < 0) {
+    return false;
+  }
+
+  keyPos += strlen(key);
+  int endPos = keyPos;
+  while (endPos < (int)section.length()) {
+    char c = section[endPos];
+    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+      endPos++;
+      continue;
+    }
+    break;
+  }
+
+  value = section.substring(keyPos, endPos).toFloat();
+  return true;
+}
+
+const char *weatherCodeLabel(int code) {
+  switch (code) {
+    case 0: return "CLEAR";
+    case 1: return "MOSTLY CLEAR";
+    case 2: return "PARTLY CLOUDY";
+    case 3: return "CLOUDY";
+    case 45:
+    case 48: return "FOG";
+    case 51:
+    case 53:
+    case 55: return "DRIZZLE";
+    case 56:
+    case 57: return "FREEZING DRIZZLE";
+    case 61:
+    case 63:
+    case 65: return "RAIN";
+    case 66:
+    case 67: return "FREEZING RAIN";
+    case 71:
+    case 73:
+    case 75: return "SNOW";
+    case 77: return "SNOW GRAINS";
+    case 80:
+    case 81:
+    case 82: return "SHOWERS";
+    case 85:
+    case 86: return "SNOW SHOWERS";
+    case 95: return "STORM";
+    case 96:
+    case 99: return "HAIL STORM";
+    default: return "WEATHER";
+  }
+}
+
+void storeQuote(const String &quoteText) {
+  if (quoteText.length() == 0) {
+    return;
+  }
+
+  quoteCache[quoteCacheHead].valid = true;
+  quoteCache[quoteCacheHead].text = quoteText;
+  quoteCache[quoteCacheHead].lastUpdateMs = millis();
+
+  quoteCurrentIndex = quoteCacheHead;
+  quoteCacheHead = (quoteCacheHead + 1) % QUOTE_CACHE_SIZE;
+  if (quoteCacheCount < QUOTE_CACHE_SIZE) {
+    quoteCacheCount++;
+  }
+
+  resetQuoteScroll();
+}
+
+String getCurrentQuoteText() {
+  if (quoteCacheCount == 0) {
+    return "Tap to fetch a quote";
+  }
+
+  if (quoteCurrentIndex < 0 || quoteCurrentIndex >= QUOTE_CACHE_SIZE || !quoteCache[quoteCurrentIndex].valid) {
+    int newestIndex = (quoteCacheHead - 1 + QUOTE_CACHE_SIZE) % QUOTE_CACHE_SIZE;
+    if (quoteCache[newestIndex].valid) {
+      quoteCurrentIndex = newestIndex;
+    }
+  }
+
+  if (quoteCurrentIndex < 0 || quoteCurrentIndex >= QUOTE_CACHE_SIZE || !quoteCache[quoteCurrentIndex].valid) {
+    return "Tap to fetch a quote";
+  }
+
+  return quoteCache[quoteCurrentIndex].text;
+}
+
+void resetQuoteScroll() {
+  quoteDisplayedText = "";
+  quoteScrollX = SCREEN_WIDTH;
+  quoteScrollTextWidth = 0;
+  quoteScrollLastStepMs = 0;
+}
+
+void formatUptime(char *buffer, size_t bufferSize) {
+  unsigned long totalSeconds = millis() / 1000UL;
+  unsigned long days = totalSeconds / 86400UL;
+  totalSeconds %= 86400UL;
+  unsigned long hours = totalSeconds / 3600UL;
+  totalSeconds %= 3600UL;
+  unsigned long minutes = totalSeconds / 60UL;
+
+  snprintf(buffer, bufferSize, "%lud %02lu:%02lu", days, hours, minutes);
+}
+
+void drawWeatherScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  char timeBuffer[16] = "SYNCING";
+  char dateBuffer[16] = "";
+  struct tm timeInfo;
+  if (getLocalTime(&timeInfo, 20)) {
+    strftime(timeBuffer, sizeof(timeBuffer), "%H:%M", &timeInfo);
+    strftime(dateBuffer, sizeof(dateBuffer), "%a %d", &timeInfo);
+  }
+
+  display.setCursor(0, 0);
+  display.print("PET BOT");
+
+  display.setCursor(0, 12);
+  display.print(timeBuffer);
+  display.print(" ");
+  display.print(dateBuffer);
+
+  display.setCursor(0, 24);
+  if (weather.valid) {
+    display.print(weather.temperature, 1);
+    display.print("C ");
+    display.print(weatherCodeLabel(weather.weatherCode));
+  } else {
+    display.print("Weather syncing");
+  }
+
+  display.setCursor(0, 36);
+  if (weather.valid) {
+    display.print("Wind ");
+    display.print(weather.windSpeed, 1);
+    display.print(" km/h");
+  } else {
+    display.print("Waiting for data");
+  }
+
+  display.setCursor(0, 48);
+  display.print("IP ");
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print(WiFi.localIP());
+  } else {
+    display.print("offline");
+  }
+
+  display.setCursor(0, 56);
+  display.print("2x tap = system");
+  display.display();
+}
+
+void drawQuoteScreen() {
+  String quoteText = getCurrentQuoteText();
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextWrap(false);
+
+  display.setCursor(0, 0);
+  display.print("QUOTE");
+
+  display.setCursor(0, 12);
+  display.print("Tap = next quote");
+
+  if (quoteText != quoteDisplayedText) {
+    quoteDisplayedText = quoteText;
+    int16_t x1 = 0;
+    int16_t y1 = 0;
+    uint16_t w = 0;
+    uint16_t h = 0;
+    display.getTextBounds(quoteDisplayedText.c_str(), 0, 0, &x1, &y1, &w, &h);
+    quoteScrollTextWidth = (int)w;
+    quoteScrollX = SCREEN_WIDTH;
+    quoteScrollLastStepMs = millis();
+  }
+
+  if (quoteScrollTextWidth <= SCREEN_WIDTH) {
+    int16_t x = (SCREEN_WIDTH - quoteScrollTextWidth) / 2;
+    if (x < 0) {
+      x = 0;
+    }
+    display.setCursor(x, 34);
+    display.print(quoteDisplayedText);
+  } else {
+    unsigned long now = millis();
+    if (quoteScrollLastStepMs == 0 || now - quoteScrollLastStepMs >= QUOTE_SCROLL_STEP_MS) {
+      quoteScrollX--;
+      quoteScrollLastStepMs = now;
+      if (quoteScrollX < -quoteScrollTextWidth) {
+        quoteScrollX = SCREEN_WIDTH;
+      }
+    }
+
+    display.setCursor(quoteScrollX, 34);
+    display.print(quoteDisplayedText);
+  }
+
+  display.setCursor(0, 56);
+  display.print(quoteCacheCount);
+  display.print("/5 cached");
+  display.display();
+}
+
+void drawSystemScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  char uptimeBuffer[20];
+  formatUptime(uptimeBuffer, sizeof(uptimeBuffer));
+
+  display.setCursor(0, 0);
+  display.print("SYSTEM");
+
+  display.setCursor(0, 12);
+  display.print("WiFi ");
+  display.print(WiFi.status() == WL_CONNECTED ? "OK" : "OFFLINE");
+
+  display.setCursor(0, 24);
+  display.print("IP ");
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print(WiFi.localIP());
+  } else {
+    display.print("0.0.0.0");
+  }
+
+  display.setCursor(0, 36);
+  display.print("RSSI ");
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print(WiFi.RSSI());
+    display.print(" dBm");
+  } else {
+    display.print("n/a");
+  }
+
+  display.setCursor(0, 48);
+  display.print("UP ");
+  display.print(uptimeBuffer);
+
+  display.setCursor(0, 56);
+  display.print("2x tap = face");
+  display.display();
+}
