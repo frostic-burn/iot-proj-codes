@@ -1,0 +1,90 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const int input1Pin = 2;
+const int input2Pin = 3;
+const int selectorPin = 4;
+const int ledPin = 5;
+
+String gateNames[] = {"AND", "OR", "XOR", "NAND", "NOR", "XNOR"};
+int gateIndex = 0;
+
+bool lastSelectorState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 200;
+
+void setup() {
+  pinMode(input1Pin, INPUT_PULLUP);
+  pinMode(input2Pin, INPUT_PULLUP);
+  pinMode(selectorPin, INPUT_PULLUP);
+  pinMode(ledPin, OUTPUT);
+
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Logic Gate Simulator");
+  display.display();
+  delay(1000);
+}
+
+void loop() {
+  bool input1 = !digitalRead(input1Pin);
+  bool input2 = !digitalRead(input2Pin);
+  bool selectorState = digitalRead(selectorPin);
+
+  if (selectorState == LOW && lastSelectorState == HIGH && (millis() - lastDebounceTime > debounceDelay)) {
+    gateIndex = (gateIndex + 1) % 6;
+    lastDebounceTime = millis();
+  }
+  lastSelectorState = selectorState;
+
+  bool result = false;
+  String gate = gateNames[gateIndex];
+
+  if (gate == "AND")    result = input1 && input2;
+  if (gate == "OR")     result = input1 || input2;
+  if (gate == "XOR")    result = input1 ^ input2;
+  if (gate == "NAND")   result = !(input1 && input2);
+  if (gate == "NOR")    result = !(input1 || input2);
+  if (gate == "XNOR")   result = !(input1 ^ input2);
+
+  digitalWrite(ledPin, (input1 || input2) ? HIGH : LOW);
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Gate:");
+  display.setCursor(60, 0);
+  display.println(gate);
+
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.print("In1:");
+  display.setCursor(30, 20);
+  display.println(input1);
+
+  display.setCursor(0, 30);
+  display.print("In2:");
+  display.setCursor(30, 30);
+  display.println(input2);
+
+  display.setCursor(0, 40);
+  display.print("Output:");
+  display.setCursor(60, 40);
+  display.println(result);
+
+  display.display();
+  delay(50);
+}
