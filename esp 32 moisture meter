@@ -1,0 +1,358 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+// WiFi credentials
+const char* ssid = "aps";
+const char* password = "11223344";
+
+// Pins
+const int soilPin = 34;
+int moistureThreshold = 2500;
+int currentMoisture = 0;
+
+WebServer server(80);
+
+// HTML generator
+String getMainPage() {
+  int moisturePercent = map(currentMoisture, 4095, 0, 0, 100);
+
+  // Start of HTML content as raw string
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>🌿 ESP32 Moisture Monitor</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { 
+      font-family: 'Segoe UI', Arial, sans-serif; 
+      text-align: center; 
+      background: #f0f8f1; 
+      padding: 20px; 
+      color: #333;
+    }
+    h1 { 
+      color: #2c7744;
+      margin-bottom: 30px;
+    }
+    .card { 
+      background: white; 
+      padding: 25px; 
+      border-radius: 15px; 
+      box-shadow: 0 8px 16px rgba(0,0,0,0.1); 
+      margin: 20px auto; 
+      width: 90%; 
+      max-width: 400px; 
+    }
+    .card h2 {
+      color: #2c7744;
+      margin-top: 0;
+    }
+    .value { 
+      font-size: 1.8em; 
+      color: #2980b9; 
+      font-weight: bold;
+    }
+    .status { 
+      font-size: 1.2em; 
+      margin: 15px 0; 
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 20px;
+    }
+    .status-label {
+      font-weight: bold;
+    }
+    .slider-container {
+      margin: 25px 0 10px 0;
+    }
+    .slider { 
+      width: 90%; 
+      height: 10px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #e0e0e0;
+      border-radius: 5px;
+      outline: none;
+    }
+    .slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #2c7744;
+      cursor: pointer;
+    }
+    .slider::-moz-range-thumb {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #2c7744;
+      cursor: pointer;
+    }
+    .gauge-container {
+      position: relative;
+      width: 220px;
+      height: 120px;
+      margin: 0 auto 30px auto;
+    }
+    .gauge {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      overflow: hidden;
+    }
+    .gauge-background {
+      width: 220px;
+      height: 120px;
+      border-radius: 120px 120px 0 0;
+      position: absolute;
+      background: #f5f5f5;
+      overflow: hidden;
+    }
+    .gauge-fill {
+      width: 220px;
+      height: 120px;
+      border-radius: 120px 120px 0 0;
+      background: linear-gradient(to right, #ff6b6b, #ffdd59, #48dbfb, #1dd1a1);
+      position: absolute;
+      transform-origin: center bottom;
+      transition: transform 0.5s ease;
+    }
+    .gauge-center {
+      width: 180px;
+      height: 100px;
+      border-radius: 100px 100px 0 0;
+      background: white;
+      position: absolute;
+      top: 10px;
+      left: 20px;
+    }
+    .gauge-value {
+      position: absolute;
+      bottom: 15px;
+      width: 100%;
+      text-align: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: #333;
+    }
+    .gauge-needle {
+      position: absolute;
+      bottom: 0;
+      left: 110px;
+      width: 2px;
+      height: 105px;
+      background: #333;
+      transform-origin: bottom center;
+      transition: transform 0.5s ease;
+      z-index: 10;
+    }
+    .gauge-needle:after {
+      content: '';
+      position: absolute;
+      bottom: -5px;
+      left: -4px;
+      width: 10px;
+      height: 10px;
+      background: #333;
+      border-radius: 50%;
+    }
+    .moisture-status {
+      font-weight: bold;
+      margin-top: 10px;
+      font-size: 1.3em;
+    }
+    .footer {
+      font-size: 0.8em;
+      color: #777;
+      margin-top: 30px;
+    }
+  </style>
+</head>
+<body onload="updateData()">
+  <h1>🌱 Smart Soil Moisture Monitor</h1>
+  <div class="card">
+    <h2>Soil Moisture Level</h2>
+    
+    <div class="gauge-container">
+      <div class="gauge">
+        <div class="gauge-background"></div>
+        <div class="gauge-fill" id="gauge-fill"></div>
+        <div class="gauge-center"></div>
+        <div class="gauge-needle" id="gauge-needle"></div>
+        <div class="gauge-value"><span id="percent">...</span></div>
+      </div>
+    </div>
+    
+    <div class="moisture-status" id="moisture-status">Loading...</div>
+    
+    <div class="status">
+      <span class="status-label">Raw Value:</span>
+      <span class="value" id="moisture">...</span>
+    </div>
+    
+    <div class="status">
+      <span class="status-label">Threshold:</span>
+      <span id="thresholdValue">...</span>
+    </div>
+    
+    <div class="slider-container">
+      <div style="margin-bottom: 10px; font-weight: bold;">Adjust Watering Threshold</div>
+      <input type="range" min="0" max="4095" class="slider" id="threshold-slider" value=")rawliteral";
+  
+  // Insert the threshold value
+  html += String(moistureThreshold);
+  
+  // Continue with the rest of the HTML
+  html += R"rawliteral(" onchange="updateThreshold(this.value)">
+    </div>
+  </div>
+  
+  <div class="footer">Last updated: <span id="last-updated">Just now</span></div>
+
+  <script>
+    function updateData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          // Update text values
+          document.getElementById("moisture").innerText = data.moisture;
+          document.getElementById("percent").innerText = data.percent + "%";
+          document.getElementById("thresholdValue").innerText = data.threshold;
+          document.getElementById("threshold-slider").value = data.threshold;
+          
+          // Update gauge
+          updateGauge(data.percent);
+          updateMoistureStatus(data.percent);
+          
+          // Update last updated time
+          const now = new Date();
+          document.getElementById("last-updated").innerText = now.toLocaleTimeString();
+        })
+        .catch(error => {
+          console.error('Error fetching data:', error);
+        });
+    }
+    
+    function updateGauge(percent) {
+      // Calculate rotation for gauge fill and needle
+      const fillRotation = (percent / 100) * 180;
+      const needleRotation = (percent / 100) * 180;
+      
+      // Update gauge fill
+      const gaugeFill = document.getElementById('gauge-fill');
+      gaugeFill.style.transform = `rotate(${180 - fillRotation}deg)`;
+      
+      // Update needle position
+      const gaugeNeedle = document.getElementById('gauge-needle');
+      gaugeNeedle.style.transform = `rotate(${needleRotation - 90}deg)`;
+    }
+    
+    function updateMoistureStatus(percent) {
+      let status = "";
+      let color = "";
+      
+      if (percent < 25) {
+        status = "Very Dry! Needs Water 💧";
+        color = "#ff6b6b";
+      } else if (percent < 50) {
+        status = "Dry - Consider Watering";
+        color = "#ffdd59";
+      } else if (percent < 75) {
+        status = "Good Moisture Level";
+        color = "#48dbfb";
+      } else {
+        status = "Well Hydrated 🌊";
+        color = "#1dd1a1";
+      }
+      
+      const statusElement = document.getElementById('moisture-status');
+      statusElement.innerText = status;
+      statusElement.style.color = color;
+    }
+    
+    function updateThreshold(value) {
+      fetch('/threshold?value=' + value)
+        .then(response => {
+          if (response.ok) {
+            updateData();
+          }
+        })
+        .catch(error => {
+          console.error('Error updating threshold:', error);
+        });
+    }
+    
+    // Update data every 3 seconds
+    setInterval(updateData, 3000);
+    
+    // Initialize gauge with placeholder data until real data loads
+    updateGauge(50);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// Route handlers
+void handleRoot() {
+  server.send(200, "text/html", getMainPage());
+}
+
+void handleThreshold() {
+  if (server.hasArg("value")) {
+    moistureThreshold = server.arg("value").toInt();
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleData() {
+  int percent = map(currentMoisture, 4095, 0, 0, 100);
+
+  String json = "{";
+  json += "\"moisture\":" + String(currentMoisture) + ",";
+  json += "\"percent\":" + String(percent) + ",";
+  json += "\"threshold\":" + String(moistureThreshold);
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+
+  if (MDNS.begin("esp32")) {
+    Serial.println("mDNS responder started! Access via http://esp32.local");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/threshold", handleThreshold);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  currentMoisture = analogRead(soilPin);
+
+  Serial.print("Soil Moisture: ");
+  Serial.println(currentMoisture);
+
+  delay(1000);  // Update every second
+}
