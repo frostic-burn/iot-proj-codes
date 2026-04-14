@@ -1,0 +1,51 @@
+#include <ESP32Servo.h>
+
+#define IR1 34
+#define greenLED 23
+#define redLED 22
+#define SERVO_PIN 18
+
+Servo gateServo;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IR1, INPUT);
+  pinMode(greenLED, OUTPUT);
+  pinMode(redLED, OUTPUT);
+
+  // Attach servo with proper PWM range
+  gateServo.attach(SERVO_PIN, 500, 2400);
+
+  // Initial state: Gate open
+  gateServo.write(0);
+  digitalWrite(greenLED, HIGH);
+  digitalWrite(redLED, LOW);
+}
+
+void loop() {
+  int sensorValue = digitalRead(IR1);
+
+  Serial.println(sensorValue);
+
+  if (sensorValue == LOW) {
+    // Train detected → Close gate
+    Serial.println("Train Incoming!");
+
+    digitalWrite(greenLED, LOW);
+    digitalWrite(redLED, HIGH);
+
+    gateServo.write(90);
+  } 
+  else {
+    // Track clear → Open gate
+    Serial.println("Track Clear");
+
+    digitalWrite(greenLED, HIGH);
+    digitalWrite(redLED, LOW);
+
+    gateServo.write(0);
+  }
+
+  delay(200);
+}
