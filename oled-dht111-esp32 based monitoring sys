@@ -1,0 +1,68 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// -------- OLED --------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// -------- DHT --------
+#define DHTPIN 2
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(9600);
+
+  // Init DHT
+  dht.begin();
+
+  // Init OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+}
+
+void loop() {
+  float temp = dht.readTemperature();     // Celsius
+  float hum  = dht.readHumidity();
+
+  // Check if reading failed
+  if (isnan(temp) || isnan(hum)) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 10);
+    display.println("Sensor Error");
+    display.display();
+    delay(2000);
+    return;
+  }
+
+  display.clearDisplay();
+
+  // -------- BIG TEXT --------
+  display.setTextColor(SSD1306_WHITE);
+
+  // Temperature (large)
+  display.setTextSize(2);   // Max comfortable for 32px height
+  display.setCursor(0, 0);
+  display.print("T:");
+  display.print(temp, 1);
+  display.print("C");
+
+  // Humidity (large)
+  display.setCursor(0, 16);
+  display.print("H:");
+  display.print(hum, 0);
+  display.print("%");
+
+  display.display();
+
+  delay(2000);
+}
