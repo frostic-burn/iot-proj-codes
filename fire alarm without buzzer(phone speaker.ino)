@@ -1,0 +1,538 @@
+/*
+ * 🔥 Fire Alarm Web Server
+ * ESP32 / ESP8266 - Flame Sensor + Browser Alarm
+ *
+ * When fire is detected, the web page plays a buzzer alarm sound
+ * and shows a live alert. Auto-refreshes every second.
+ *
+ * Wiring:
+ *   Flame Sensor OUT → GPIO 5
+ *   Flame Sensor VCC → 3.3V
+ *   Flame Sensor GND → GND
+ */
+
+// ─────────────────────────────────────────────
+//  Board Detection
+// ─────────────────────────────────────────────
+#ifdef ESP8266
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+  ESP8266WebServer server(80);
+#else
+  #include <WiFi.h>
+  #include <WebServer.h>
+  WebServer server(80);
+#endif
+
+// ─────────────────────────────────────────────
+//  Config
+// ─────────────────────────────────────────────
+const char* ssid     = "wifi";      // ← your WiFi SSID
+const char* password = "password";  // ← your WiFi password
+
+#define FLAME_PIN 5   // GPIO connected to flame sensor OUT
+
+// ─────────────────────────────────────────────
+//  HTML Page (served to browser)
+// ─────────────────────────────────────────────
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fire Alarm Monitor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@700;800&display=swap');
+
+  :root {
+    --bg:        #f0f2f5;
+    --surface:   #ffffff;
+    --border:    #e2e6ea;
+    --safe:      #16a34a;
+    --safe-bg:   #f0fdf4;
+    --safe-bd:   #bbf7d0;
+    --danger:    #dc2626;
+    --danger-bg: #fff1f2;
+    --danger-bd: #fecaca;
+    --warn:      #ea580c;
+    --text:      #1e293b;
+    --sub:       #64748b;
+    --dim:       #94a3b8;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    font-family: 'Inter', sans-serif;
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .container { width: min(460px, 100%); }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 28px;
+  }
+  .header-icon {
+    width: 36px; height: 36px;
+    background: var(--danger);
+    border-radius: 8px;
+    display: grid; place-items: center;
+    font-size: 18px;
+  }
+  .header-title {
+    font-family: 'Poppins', sans-serif;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .header-sub {
+    font-size: 0.72rem;
+    color: var(--dim);
+    margin-top: 1px;
+  }
+
+  /* Alert banner — shown only on fire */
+  .alert-banner {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    background: var(--danger-bg);
+    border: 1.5px solid var(--danger-bd);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--danger);
+    animation: slideDown 0.25s ease;
+  }
+  .alert-banner.visible { display: flex; }
+  @keyframes slideDown {
+    from { opacity:0; transform:translateY(-6px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  .blink { animation: blink 0.6s step-start infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Main card */
+  .card {
+    background: var(--surface);
+    border: 1.5px solid var(--border);
+    border-radius: 16px;
+    padding: 40px 28px 28px;
+    margin-bottom: 16px;
+    transition: border-color 0.3s, box-shadow 0.3s, background 0.3s;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }
+  .card.fire {
+    background: var(--danger-bg);
+    border-color: var(--danger-bd);
+    box-shadow: 0 0 0 4px rgba(220,38,38,0.08), 0 4px 20px rgba(220,38,38,0.12);
+    animation: shakePulse 1s ease-in-out infinite;
+  }
+  .card.safe {
+    background: var(--safe-bg);
+    border-color: var(--safe-bd);
+    box-shadow: 0 0 0 3px rgba(22,163,74,0.06), 0 2px 12px rgba(22,163,74,0.08);
+  }
+  @keyframes shakePulse {
+    0%,100% { box-shadow: 0 0 0 4px rgba(220,38,38,0.08), 0 4px 20px rgba(220,38,38,0.12); }
+    50%      { box-shadow: 0 0 0 8px rgba(220,38,38,0.14), 0 4px 32px rgba(220,38,38,0.22); }
+  }
+
+  /* Icon circle */
+  .icon-wrap {
+    width: 96px; height: 96px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 3rem;
+    margin: 0 auto 24px;
+    transition: background 0.3s;
+  }
+  .icon-wrap.safe    { background: rgba(22,163,74,0.1); }
+  .icon-wrap.fire    { background: rgba(220,38,38,0.1); animation: iconPop 0.7s ease-in-out infinite alternate; }
+  @keyframes iconPop { to { transform: scale(1.1); } }
+
+  /* Status text */
+  .status-label {
+    font-family: 'Poppins', sans-serif;
+    font-size: clamp(1.8rem, 7vw, 2.6rem);
+    font-weight: 800;
+    text-align: center;
+    margin-bottom: 6px;
+    transition: color 0.3s;
+  }
+  .status-label.safe   { color: var(--safe); }
+  .status-label.fire   { color: var(--danger); }
+
+  .status-sub {
+    text-align: center;
+    font-size: 0.82rem;
+    color: var(--sub);
+    margin-bottom: 28px;
+  }
+
+  /* Status pill */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 4px 12px;
+    border-radius: 999px;
+    margin-bottom: 28px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .pill.safe { background: rgba(22,163,74,0.12);  color: var(--safe); }
+  .pill.fire { background: rgba(220,38,38,0.12);  color: var(--danger); }
+  .pill-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .pill.fire .pill-dot { animation: blink 0.5s step-start infinite; }
+
+  /* Info grid */
+  .info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    border-top: 1px solid var(--border);
+    padding-top: 20px;
+  }
+  .info-cell {
+    text-align: center;
+  }
+  .info-val {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .info-key {
+    font-size: 0.65rem;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-top: 2px;
+  }
+
+  /* Unlock / Mute button */
+  #actionBtn {
+    width: 100%;
+    padding: 14px;
+    border-radius: 10px;
+    border: none;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.88rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  #actionBtn.unlock {
+    background: var(--danger);
+    color: #fff;
+    box-shadow: 0 2px 10px rgba(220,38,38,0.3);
+  }
+  #actionBtn.unlock:hover { background: #b91c1c; }
+  #actionBtn.mute {
+    background: var(--surface);
+    color: var(--sub);
+    border: 1.5px solid var(--border);
+  }
+  #actionBtn.mute:hover { border-color: var(--sub); color: var(--text); }
+  #actionBtn.unmute {
+    background: var(--surface);
+    color: var(--warn);
+    border: 1.5px solid rgba(234,88,12,0.35);
+  }
+
+  .footer {
+    text-align: center;
+    margin-top: 20px;
+    font-size: 0.65rem;
+    color: var(--dim);
+    letter-spacing: 0.06em;
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <div class="header">
+    <div class="header-icon">🔥</div>
+    <div>
+      <div class="header-title">Fire Alarm Monitor</div>
+      <div class="header-sub">ESP Flame Sensor · Live Dashboard</div>
+    </div>
+  </div>
+
+  <!-- Fire alert banner -->
+  <div class="alert-banner" id="alertBanner">
+    <span class="blink">🚨</span>
+    FIRE DETECTED — EVACUATE IMMEDIATELY
+  </div>
+
+  <!-- Main status card -->
+  <div class="card safe" id="card">
+    <div style="text-align:center">
+      <div class="icon-wrap safe" id="iconWrap">🛡️</div>
+      <div class="status-label safe" id="label">All Clear</div>
+      <div class="status-sub" id="sub">No flame detected by sensor</div>
+      <div>
+        <span class="pill safe" id="pill">
+          <span class="pill-dot"></span>
+          <span id="pillText">System Normal</span>
+        </span>
+      </div>
+    </div>
+    <div class="info-grid">
+      <div class="info-cell">
+        <div class="info-val">GPIO 5</div>
+        <div class="info-key">Sensor Pin</div>
+      </div>
+      <div class="info-cell">
+        <div class="info-val">1 s</div>
+        <div class="info-key">Poll Rate</div>
+      </div>
+      <div class="info-cell">
+        <div class="info-val" id="ts">--:--:--</div>
+        <div class="info-key">Last Check</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Single action button: Tap to Enable Sound → then Mute / Unmute -->
+  <button id="actionBtn" class="unlock" onclick="handleBtn()">
+    <span>👆</span> Tap to Enable Alarm Sound
+  </button>
+
+  <div class="footer">AUTO-REFRESHING · ESP FIRE MONITOR v2.0</div>
+</div>
+
+<script>
+// ─── Audio unlock ────────────────────────────────────────────────────────────
+// Browsers block audio until a user gesture. We create the AudioContext only
+// after the user taps the button, which counts as a gesture.
+// ─────────────────────────────────────────────────────────────────────────────
+let audioCtx   = null;
+let audioReady = false;   // true after user taps to unlock
+let muted      = false;
+let alarmTimer = null;
+let alarmOn    = false;
+
+function unlockAudio() {
+  // Create context on a real user-gesture click
+  audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
+  audioReady = true;
+
+  // Play a silent beep so the context is fully resumed
+  const osc = audioCtx.createOscillator();
+  const g   = audioCtx.createGain();
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  osc.connect(g); g.connect(audioCtx.destination);
+  osc.start(); osc.stop(audioCtx.currentTime + 0.001);
+
+  // Switch button to Mute mode
+  const btn = document.getElementById('actionBtn');
+  btn.className   = 'mute';
+  btn.innerHTML   = '<span>🔇</span> Mute Alarm';
+}
+
+function handleBtn() {
+  if (!audioReady) {
+    unlockAudio();
+    return;
+  }
+  // Toggle mute
+  muted = !muted;
+  const btn = document.getElementById('actionBtn');
+  if (muted) {
+    btn.className = 'unmute';
+    btn.innerHTML = '<span>🔔</span> Unmute Alarm';
+    stopAlarm();
+  } else {
+    btn.className = 'mute';
+    btn.innerHTML = '<span>🔇</span> Mute Alarm';
+    if (alarmOn) scheduleBeep(); // resume if fire still active
+  }
+}
+
+// ─── Beep generator ───────────────────────────────────────────────────────────
+function playBeep() {
+  if (!audioReady || muted || !audioCtx) return;
+
+  // Two-tone fire alarm: alternating 880 Hz / 1100 Hz square waves
+  [[880, 0], [1100, 0.22]].forEach(([freq, delay]) => {
+    const osc  = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const t    = audioCtx.currentTime + delay;
+
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(freq, t);
+
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.3,  t + 0.01);
+    gain.gain.setValueAtTime(0.3,  t + 0.17);
+    gain.gain.linearRampToValueAtTime(0,    t + 0.21);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.22);
+  });
+}
+
+function scheduleBeep() {
+  playBeep();
+  alarmTimer = setTimeout(scheduleBeep, 900);
+}
+
+function startAlarm() {
+  if (alarmOn) return;
+  alarmOn = true;
+  scheduleBeep();
+}
+
+function stopAlarm() {
+  alarmOn = false;
+  clearTimeout(alarmTimer);
+}
+
+// ─── UI update ───────────────────────────────────────────────────────────────
+function setStatus(fire) {
+  const card   = document.getElementById('card');
+  const iw     = document.getElementById('iconWrap');
+  const label  = document.getElementById('label');
+  const sub    = document.getElementById('sub');
+  const pill   = document.getElementById('pill');
+  const pt     = document.getElementById('pillText');
+  const banner = document.getElementById('alertBanner');
+
+  if (fire) {
+    card.className  = 'card fire';
+    iw.className    = 'icon-wrap fire';
+    iw.textContent  = '🔥';
+    label.className = 'status-label fire';
+    label.textContent = 'FIRE!';
+    sub.textContent = 'Flame detected — take action now!';
+    pill.className  = 'pill fire';
+    pt.textContent  = 'Alarm Active';
+    banner.classList.add('visible');
+    startAlarm();
+  } else {
+    card.className  = 'card safe';
+    iw.className    = 'icon-wrap safe';
+    iw.textContent  = '🛡️';
+    label.className = 'status-label safe';
+    label.textContent = 'All Clear';
+    sub.textContent = 'No flame detected by sensor';
+    pill.className  = 'pill safe';
+    pt.textContent  = 'System Normal';
+    banner.classList.remove('visible');
+    stopAlarm();
+  }
+
+  document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+}
+
+// ─── Polling ─────────────────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const res  = await fetch('/status');
+    const data = await res.json();
+    setStatus(data.fire);
+  } catch(e) {
+    console.warn('Poll error:', e);
+  }
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─────────────────────────────────────────────
+//  Global fire state
+// ─────────────────────────────────────────────
+bool fireDetected = false;
+
+// ─────────────────────────────────────────────
+//  Web Server Handlers
+// ─────────────────────────────────────────────
+
+// Serve the main dashboard page
+void handleRoot() {
+  server.send(200, "text/html", HTML_PAGE);
+}
+
+// JSON status endpoint — polled every second by the browser
+void handleStatus() {
+  String json = "{\"fire\":";
+  json += fireDetected ? "true" : "false";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ─────────────────────────────────────────────
+//  Setup
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  pinMode(FLAME_PIN, INPUT);
+
+  // Connect to WiFi
+  Serial.printf("\nConnecting to %s", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected!");
+  Serial.print("🌐 Open browser: http://");
+  Serial.println(WiFi.localIP());
+
+  // Register routes
+  server.on("/",       handleRoot);
+  server.on("/status", handleStatus);
+  server.begin();
+  Serial.println("🚀 Web server started.");
+}
+
+// ─────────────────────────────────────────────
+//  Loop
+// ─────────────────────────────────────────────
+void loop() {
+  server.handleClient();
+
+  int flameState = digitalRead(FLAME_PIN);
+
+  // Flame sensors are ACTIVE LOW
+  fireDetected = (flameState == LOW);
+
+  if (fireDetected) {
+    Serial.println("🔥 Fire Detected!");
+  }
+
+  delay(200);
+}
